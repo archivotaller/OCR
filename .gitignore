@@ -1,0 +1,14 @@
+# Build
+/target/
+**/*.pdb
+
+# Salidas locales de pruebas manuales
+/out/
+/salida/
+*.log
+*.tmp
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini

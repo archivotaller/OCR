@@ -1,0 +1,41 @@
+[package]
+name = "octxt"
+version = "0.1.0"
+edition = "2021"
+description = "Utilidad OCR de escritorio basada en PP-OCRv6 (tract / 100% Rust): texto, JSON y PDF buscable con capa de texto invisible."
+license = "Apache-2.0"
+
+[lib]
+name = "octxt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "octxt"
+path = "src/main.rs"
+
+[[bin]]
+name = "octxt-gui"
+path = "src/bin/octxt-gui/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "=4.6.1", features = ["derive"] }
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow"] }
+image = "0.25"
+imageproc = "0.25"
+lopdf = { version = "0.44", default-features = false, features = ["chrono", "rayon", "embed_image"] }
+rayon = "1"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tiff = "0.11"
+tract-data = "0.21.17"
+tract-onnx = "0.21.17"
+ureq = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
