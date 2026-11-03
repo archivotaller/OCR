@@ -25,7 +25,10 @@ pub fn db_postprocess(
     p: &DetParams,
 ) -> Vec<DetectedBox> {
     let prob: &[f32] = if p.apply_sigmoid {
-        &prob.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect::<Vec<_>>()
+        &prob
+            .iter()
+            .map(|v| 1.0 / (1.0 + (-v).exp()))
+            .collect::<Vec<_>>()
     } else {
         prob
     };
@@ -35,7 +38,11 @@ pub fn db_postprocess(
     for y in 0..net_h {
         for x in 0..net_w {
             let v = prob[y * net_w + x];
-            bitmap.put_pixel(x as u32, y as u32, Luma([if v > p.thresh { 255 } else { 0 }]));
+            bitmap.put_pixel(
+                x as u32,
+                y as u32,
+                Luma([if v > p.thresh { 255 } else { 0 }]),
+            );
         }
     }
 

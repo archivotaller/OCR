@@ -55,12 +55,7 @@ pub fn min_area_rect(points: &[Pt]) -> ([Pt; 4], f32) {
             maxx = maxx.max(x);
             maxy = maxy.max(y);
         }
-        let r = [
-            (minx, miny),
-            (maxx, miny),
-            (maxx, maxy),
-            (minx, maxy),
-        ];
+        let r = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)];
         return (r, (maxx - minx).min(maxy - miny));
     }
 
@@ -177,8 +172,7 @@ pub fn point_in_quad(px: f32, py: f32, q: &[Pt; 4]) -> bool {
     for i in 0..4 {
         let (xi, yi) = q[i];
         let (xj, yj) = q[j];
-        if ((yi > py) != (yj > py))
-            && (px < (xj - xi) * (py - yi) / (yj - yi + f32::EPSILON) + xi)
+        if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi + f32::EPSILON) + xi)
         {
             inside = !inside;
         }

@@ -76,7 +76,8 @@ pub fn rewrite(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize, usize, usize)> {
             let (k, digits) = digits_after(&out, i + PREFIX.len())?;
             let len_of = k - i;
 
-            if !is_printable(out[i - 1]) && out[i - 1] as usize == len_of && out[i - 2] & 0x07 == 2 {
+            if !is_printable(out[i - 1]) && out[i - 1] as usize == len_of && out[i - 2] & 0x07 == 2
+            {
                 // Nombre simbólico: string protobuf que empieza exactamente aquí.
                 let nn = new_name(&digits);
                 debug_assert_eq!(nn.len(), len_of);
@@ -100,7 +101,10 @@ pub fn rewrite(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize, usize, usize)> {
                 r
             };
             if replacement.len() != len {
-                anyhow::bail!("reemplazo con longitud distinta ({}) para len {len}", replacement.len());
+                anyhow::bail!(
+                    "reemplazo con longitud distinta ({}) para len {len}",
+                    replacement.len()
+                );
             }
             out[s..s + len].copy_from_slice(&replacement);
             patches += 1;
@@ -163,9 +167,7 @@ fn analyze_expr(text: &str) -> anyhow::Result<(usize, String)> {
         .ok_or_else(|| anyhow::anyhow!("patrón interno inesperado en {text:?}"))?;
     let expected_tail = "/2)".repeat(nfunc - 1) + " + 1";
     if tail != expected_tail {
-        anyhow::bail!(
-            "forma inesperada en {text:?}: cola {tail:?} != {expected_tail:?}"
-        );
+        anyhow::bail!("forma inesperada en {text:?}: cola {tail:?} != {expected_tail:?}");
     }
     let digits = sym
         .strip_prefix("DynamicDimension.")

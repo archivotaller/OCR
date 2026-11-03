@@ -25,9 +25,7 @@ fn main() -> anyhow::Result<()> {
                 s -= 1;
             }
             let mut e = i + 5;
-            while e < bytes.len()
-                && (bytes[e] >= 0x20 && bytes[e] <= 0x7E || bytes[e] == b'\n')
-            {
+            while e < bytes.len() && (bytes[e] >= 0x20 && bytes[e] <= 0x7E || bytes[e] == b'\n') {
                 e += 1;
             }
             let text = String::from_utf8_lossy(&bytes[s..e]).to_string();

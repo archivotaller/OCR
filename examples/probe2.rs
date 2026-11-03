@@ -8,7 +8,9 @@ use tract_onnx::prelude::*;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().ok_or_else(|| anyhow::anyhow!("uso: probe2 <model.onnx> [b h w]"))?;
+    let path = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("uso: probe2 <model.onnx> [b h w]"))?;
     let b: usize = args.get(1).map(|s| s.parse().unwrap()).unwrap_or(1);
     let h: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(64);
     let w: usize = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(64);

@@ -124,7 +124,10 @@ pub fn cache_dir() -> PathBuf {
         return PathBuf::from(local).join("octxt").join("models");
     }
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache").join("octxt").join("models");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("octxt")
+            .join("models");
     }
     PathBuf::from("octxt-models")
 }
@@ -146,8 +149,7 @@ pub fn ensure(id: &str) -> Result<PathBuf> {
     let path = dir.join(format!("{}.onnx", spec.id));
 
     if path.exists() {
-        let cached = std::fs::read(&path)
-            .with_context(|| format!("leyendo {}", path.display()))?;
+        let cached = std::fs::read(&path).with_context(|| format!("leyendo {}", path.display()))?;
         if sha256_hex(&cached) == spec.sha256 {
             return Ok(path);
         }
@@ -181,10 +183,8 @@ pub fn ensure(id: &str) -> Result<PathBuf> {
     }
 
     let tmp = dir.join(format!("{}.tmp", spec.id));
-    std::fs::write(&tmp, &bytes)
-        .with_context(|| format!("escribiendo {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("finalizando {}", path.display()))?;
+    std::fs::write(&tmp, &bytes).with_context(|| format!("escribiendo {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("finalizando {}", path.display()))?;
     eprintln!(
         "  ✓ {}.onnx cacheado ({} bytes, SHA-256 verificado)",
         spec.id,
@@ -222,8 +222,7 @@ pub fn verify_cached(id: &str) -> Result<()> {
     if !path.exists() {
         bail!("no está cacheado: {}", spec.id);
     }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("leyendo {}", path.display()))?;
+    let bytes = std::fs::read(&path).with_context(|| format!("leyendo {}", path.display()))?;
     let got = sha256_hex(&bytes);
     if got != spec.sha256 {
         bail!(
