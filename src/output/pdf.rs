@@ -67,10 +67,7 @@ fn tounicode_cmap(codes: &[u16]) -> String {
         }
         s.push_str(&format!("{} beginbfrange\n", groups.len()));
         for (start, end) in groups {
-            s.push_str(&format!(
-                "<{:04X}> <{:04X}> <{:04X}>\n",
-                start, end, start
-            ));
+            s.push_str(&format!("<{:04X}> <{:04X}> <{:04X}>\n", start, end, start));
         }
         s.push_str("endbfrange\n");
     }
@@ -87,10 +84,10 @@ fn tounicode_cmap(codes: &[u16]) -> String {
 fn box_bounds(line: &OcrLine) -> (f32, f32, f32, f32) {
     let xs: Vec<f32> = line.points.iter().map(|p| p.0).collect();
     let ys: Vec<f32> = line.points.iter().map(|p| p.1).collect();
-    let left = *xs.iter().fold(&f32::MAX, |a, b| if b < a { b } else { a }) as f32;
-    let top = *ys.iter().fold(&f32::MAX, |a, b| if b < a { b } else { a }) as f32;
-    let right = *xs.iter().fold(&f32::MIN, |a, b| if b > a { b } else { a }) as f32;
-    let bottom = *ys.iter().fold(&f32::MIN, |a, b| if b > a { b } else { a }) as f32;
+    let left = xs.iter().copied().fold(f32::MAX, f32::min);
+    let top = ys.iter().copied().fold(f32::MAX, f32::min);
+    let right = xs.iter().copied().fold(f32::MIN, f32::max);
+    let bottom = ys.iter().copied().fold(f32::MIN, f32::max);
     (left, top, (right - left).max(1.0), (bottom - top).max(1.0))
 }
 
@@ -98,9 +95,7 @@ fn box_bounds(line: &OcrLine) -> (f32, f32, f32, f32) {
 /// dependencias (CIDFont, descriptor, CMap). Devuelve el ObjectId de la Type0.
 fn add_unicode_font(doc: &mut Document, chars: &BTreeSet<u16>) -> Result<ObjectId> {
     let base = "ArialMT";
-    let cmap_content = tounicode_cmap(
-        &chars.iter().copied().collect::<Vec<u16>>(),
-    );
+    let cmap_content = tounicode_cmap(&chars.iter().copied().collect::<Vec<u16>>());
     let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap_content.into_bytes()));
 
     let descriptor_id = doc.add_object(dictionary! {
@@ -143,113 +138,153 @@ fn add_unicode_font(doc: &mut Document, chars: &BTreeSet<u16>) -> Result<ObjectI
     Ok(font_id)
 }
 
-/// Construye un PDF con capa de texto invisible y lo guarda en `out`.
+/// Una página para el PDF buscable.
+pub struct PdfPage<'a> {
+    /// Bytes crudos del archivo origen (solo se reutilizan si son JPEG).
+    pub orig_bytes: Option<&'a [u8]>,
+    /// Imagen ya decodificada de la página.
+    pub image: &'a image::DynamicImage,
+    /// Líneas OCR de esta página.
+    pub lines: &'a [OcrLine],
+}
+
+/// Construye un PDF de una sola página con capa de texto invisible.
 ///
 /// `orig_bytes` son los bytes crudos del archivo origen (si es JPEG se
 /// reutilizan byte a byte para no perder calidad); si no, se codifica desde
-/// `img`. `img` es la primera página decodificada.
+/// `img`.
 pub fn searchable_pdf(
     orig_bytes: Option<&[u8]>,
     img: &image::DynamicImage,
     lines: &[OcrLine],
     out: &Path,
 ) -> Result<()> {
-    let (w, h) = (img.width() as u32, img.height() as u32);
-    if w == 0 || h == 0 {
-        anyhow::bail!("imagen vacía para PDF");
-    }
-
-    // Imagen: JPEG original o re-codificación a JPEG desde la página decodificada.
-    let bytes: Vec<u8> = match orig_bytes {
-        Some(b) if is_jpeg(b) => b.to_vec(),
-        _ => img_to_jpeg(img)?,
+    let page = PdfPage {
+        orig_bytes,
+        image: img,
+        lines,
     };
-    let image_stream = xobject::image_from(bytes).with_context(|| "incrustando imagen")?;
+    searchable_pdf_pages(&[page], out)
+}
+
+/// Construye un PDF buscable de varias páginas: una imagen a página completa
+/// por página + una única fuente Type0/ToUnicode que cubre todos los textos.
+pub fn searchable_pdf_pages(pages: &[PdfPage<'_>], out: &Path) -> Result<()> {
+    anyhow::ensure!(!pages.is_empty(), "no hay páginas para generar el PDF");
 
     let mut doc = Document::with_version("1.7");
-    let image_id = doc.add_object(image_stream);
-    let img_name = "Im1";
 
-    // Todos los codepoints usados por el texto (para el CMap ToUnicode).
+    // Todos los codepoints usados por el texto de todas las páginas.
     let mut chars: BTreeSet<u16> = BTreeSet::new();
-    for line in lines {
-        for u in line.text.encode_utf16() {
-            chars.insert(u);
+    for page in pages {
+        for line in page.lines {
+            for u in line.text.encode_utf16() {
+                chars.insert(u);
+            }
         }
     }
     let font_id = add_unicode_font(&mut doc, &chars)?;
-    let resources_id = doc.add_object(dictionary! {
-        "Font" => dictionary! {
-            "F1" => font_id,
-        },
-        "XObject" => dictionary! {
-            img_name => image_id,
-        },
-    });
-
-    // Flujo de contenido: imagen a página completa + capa invisible.
-    let mut ops: Vec<Operation> = vec![
-        Operation::new("q", vec![]),
-        Operation::new(
-            "cm",
-            vec![
-                Object::Real(w as f32),
-                Object::Real(0.0),
-                Object::Real(0.0),
-                Object::Real(h as f32),
-                Object::Real(0.0),
-                Object::Real(0.0),
-            ],
-        ),
-        Operation::new("Do", vec![Object::Name(img_name.as_bytes().to_vec())]),
-        Operation::new("Q", vec![]),
-    ];
-
-    for line in lines {
-        if line.text.is_empty() {
-            continue;
-        }
-        let (left, top, box_w, box_h) = box_bounds(line);
-        let nchars = line.text.chars().count().max(1) as f32;
-        // Tamaño de fuente para que el texto (aprox. 0.55 em por carácter)
-        // quepa en la caja, limitado por la altura de la línea.
-        let fs = (box_h.min(box_w / (nchars * 0.55))).clamp(4.0, box_h);
-        // En PDF y crece hacia arriba: la base del texto queda ~0.15 em bajo
-        // el borde superior de la caja.
-        let x = left;
-        let baseline = (h as f32 - (top + fs * 0.85)).max(0.0);
-        ops.extend(vec![
-            Operation::new("BT", vec![]),
-            Operation::new("Tr", vec![Object::Integer(3)]),
-            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Real(fs)]),
-            Operation::new("Td", vec![Object::Real(x), Object::Real(baseline)]),
-            Operation::new(
-                "Tj",
-                vec![Object::String(utf16be(&line.text), StringFormat::Hexadecimal)],
-            ),
-            Operation::new("ET", vec![]),
-        ]);
-    }
-
-    let content = Content { operations: ops };
-    let content_bytes = content.encode().with_context(|| "codificando contenido")?;
-    let content_id = doc.add_object(Stream::new(dictionary! {}, content_bytes));
 
     let pages_id = doc.new_object_id();
-    let page_id = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => pages_id,
-        "Contents" => content_id,
-        "Resources" => resources_id,
-        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(w as i64), Object::Integer(h as i64)],
-    });
+    let mut kids: Vec<Object> = Vec::with_capacity(pages.len());
+
+    for page in pages {
+        let img = page.image;
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            anyhow::bail!("página con imagen vacía en el PDF");
+        }
+
+        // Imagen: JPEG original o re-codificación a JPEG desde la página.
+        let bytes: Vec<u8> = match page.orig_bytes {
+            Some(b) if is_jpeg(b) => b.to_vec(),
+            _ => img_to_jpeg(img)?,
+        };
+        let image_stream = xobject::image_from(bytes).with_context(|| "incrustando imagen")?;
+        let image_id = doc.add_object(image_stream);
+        let img_name = "Im1";
+
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_id,
+            },
+            "XObject" => dictionary! {
+                img_name => image_id,
+            },
+        });
+
+        // Flujo de contenido: imagen a página completa + capa invisible.
+        let mut ops: Vec<Operation> = vec![
+            Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    Object::Real(w as f32),
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(h as f32),
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                ],
+            ),
+            Operation::new("Do", vec![Object::Name(img_name.as_bytes().to_vec())]),
+            Operation::new("Q", vec![]),
+        ];
+
+        for line in page.lines {
+            if line.text.is_empty() {
+                continue;
+            }
+            let (left, top, box_w, box_h) = box_bounds(line);
+            let nchars = line.text.chars().count().max(1) as f32;
+            // Tamaño de fuente para que el texto (aprox. 0.55 em por carácter)
+            // quepa en la caja, limitado por la altura de la línea.
+            let fs = (box_h.min(box_w / (nchars * 0.55))).clamp(4.0, box_h);
+            // En PDF y crece hacia arriba: la base del texto queda ~0.15 em bajo
+            // el borde superior de la caja.
+            let x = left;
+            let baseline = (h as f32 - (top + fs * 0.85)).max(0.0);
+            ops.extend(vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tr", vec![Object::Integer(3)]),
+                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Real(fs)]),
+                Operation::new("Td", vec![Object::Real(x), Object::Real(baseline)]),
+                Operation::new(
+                    "Tj",
+                    vec![Object::String(
+                        utf16be(&line.text),
+                        StringFormat::Hexadecimal,
+                    )],
+                ),
+                Operation::new("ET", vec![]),
+            ]);
+        }
+
+        let content = Content { operations: ops };
+        let content_bytes = content.encode().with_context(|| "codificando contenido")?;
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content_bytes));
+
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(w as i64),
+                Object::Integer(h as i64),
+            ],
+        });
+        kids.push(Object::Reference(page_id));
+    }
 
     doc.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![Object::Reference(page_id)],
-            "Count" => 1,
+            "Kids" => kids,
+            "Count" => pages.len() as i64,
         }),
     );
 
@@ -259,6 +294,7 @@ pub fn searchable_pdf(
     });
     doc.trailer.set("Root", catalog_id);
     doc.compress();
-    doc.save(out).with_context(|| format!("guardando {}", out.display()))?;
+    doc.save(out)
+        .with_context(|| format!("guardando {}", out.display()))?;
     Ok(())
 }

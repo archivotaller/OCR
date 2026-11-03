@@ -69,17 +69,8 @@ impl Default for Normalize {
 }
 
 /// Configuración completa del motor de detección.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DetConfig {
     pub params: DetParams,
     pub normalize: Normalize,
-}
-
-impl Default for DetConfig {
-    fn default() -> Self {
-        DetConfig {
-            params: DetParams::default(),
-            normalize: Normalize::default(),
-        }
-    }
 }

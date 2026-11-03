@@ -1,12 +1,12 @@
 //! Definición de la CLI y despacho de comandos.
 
+use anyhow::{bail, Context, Result};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use octxt::image_io;
 use octxt::models::{self, Tier};
 use octxt::ocr::config::{DetConfig, DetParams};
 use octxt::ocr::engine::{Engine, EngineConfig};
 use octxt::output::{common::FileResult, json, txt};
-use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -29,7 +29,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub model_dir: Option<PathBuf>,
 
-    /// Número de hilos (por defecto: núcleos físicos).
+    /// Número de hilos de cómputo (por defecto: todos los núcleos lógicos).
     #[arg(long, global = true)]
     pub threads: Option<usize>,
 
@@ -183,8 +183,7 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Check => {
             for id in [tier.det_id(), tier.rec_id()] {
-                models::verify_cached(id)
-                    .with_context(|| format!("verificando {id}"))?;
+                models::verify_cached(id).with_context(|| format!("verificando {id}"))?;
                 println!("✓ {id}: ok");
             }
             Ok(())
@@ -240,6 +239,8 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
+// Los parámetros reflejan los flags globales de la CLI uno a uno.
+#[allow(clippy::too_many_arguments)]
 fn build_engine(
     tier: Tier,
     det_thresh: f32,
@@ -283,7 +284,10 @@ fn expand_inputs(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
             collect_dir(p, recursive, &mut out)?;
         } else if p.exists() {
             if !image_io::has_image_ext(p) {
-                eprintln!("aviso: ignorando '{}' (extensión no soportada)", p.display());
+                eprintln!(
+                    "aviso: ignorando '{}' (extensión no soportada)",
+                    p.display()
+                );
                 continue;
             }
             out.push(p.clone());
@@ -296,8 +300,8 @@ fn expand_inputs(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
 }
 
 fn collect_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("leyendo directorio {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("leyendo directorio {}", dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -347,8 +351,7 @@ fn run_txt(engine: &Engine, a: &TxtArgs) -> Result<()> {
     }
 
     if let Some(dir) = &a.out_dir {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creando {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creando {}", dir.display()))?;
         for r in &results {
             let stem = Path::new(&r.file)
                 .file_stem()
@@ -436,47 +439,64 @@ fn run_pdf(engine: &Engine, a: &PdfArgs) -> Result<()> {
         bail!("--out solo es válido con una única imagen de entrada");
     }
     if let Some(dir) = &a.out_dir {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creando {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creando {}", dir.display()))?;
     }
 
     for f in &files {
         let orig_bytes = std::fs::read(f).ok();
         let imgs = image_io::load_images(f)?;
+        if imgs.is_empty() {
+            continue;
+        }
+
+        // OCR de todas las páginas y un único PDF multipágina por archivo.
+        let mut lines_per_page: Vec<Vec<octxt::ocr::engine::OcrLine>> =
+            Vec::with_capacity(imgs.len());
         for (idx, img) in imgs.iter().enumerate() {
             let t0 = Instant::now();
             let lines = engine.ocr(img)?;
             eprintln!(
-                "{}: {} líneas en {} ms",
+                "{}: página {}/{}: {} líneas en {} ms",
                 f.display(),
+                idx + 1,
+                imgs.len(),
                 lines.len(),
                 t0.elapsed().as_millis()
             );
-
-            let out_path = if let Some(out) = &a.out {
-                out.clone()
-            } else if let Some(dir) = &a.out_dir {
-                let stem = f
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "imagen".to_string());
-                if imgs.len() > 1 {
-                    dir.join(format!("{stem}_p{}.pdf", idx + 1))
-                } else {
-                    dir.join(format!("{stem}.pdf"))
-                }
-            } else {
-                let stem = f
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "imagen".to_string());
-                f.with_file_name(format!("{stem}.pdf"))
-            };
-
-            let bytes_for_pdf = if idx == 0 { orig_bytes.as_deref() } else { None };
-            octxt::output::pdf::searchable_pdf(bytes_for_pdf, img, &lines, &out_path)?;
-            eprintln!("✓ {}", out_path.display());
+            lines_per_page.push(lines);
         }
+
+        let out_path = if let Some(out) = &a.out {
+            out.clone()
+        } else if let Some(dir) = &a.out_dir {
+            let stem = f
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "imagen".to_string());
+            dir.join(format!("{stem}.pdf"))
+        } else {
+            let stem = f
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "imagen".to_string());
+            f.with_file_name(format!("{stem}.pdf"))
+        };
+
+        let pages: Vec<octxt::output::pdf::PdfPage<'_>> = imgs
+            .iter()
+            .enumerate()
+            .map(|(idx, img)| octxt::output::pdf::PdfPage {
+                orig_bytes: if idx == 0 {
+                    orig_bytes.as_deref()
+                } else {
+                    None
+                },
+                image: img,
+                lines: &lines_per_page[idx],
+            })
+            .collect();
+        octxt::output::pdf::searchable_pdf_pages(&pages, &out_path)?;
+        eprintln!("✓ {}", out_path.display());
     }
     Ok(())
 }

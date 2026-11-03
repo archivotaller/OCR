@@ -33,11 +33,7 @@ fn bucket_width(w: u32) -> u32 {
 /// Recorta y rectifica por perspectiva un cuadrilátero de la imagen origen a
 /// una tira RGB vertical (equivalente a `get_rotate_crop_image`).
 pub fn rectify_crop(src: &RgbImage, quad: &[Pt; 4], pad: bool) -> RgbImage {
-    let quad = if pad {
-        padded_quad(src, quad)
-    } else {
-        *quad
-    };
+    let quad = if pad { padded_quad(src, quad) } else { *quad };
     let w = dist(quad[0], quad[1])
         .max(dist(quad[3], quad[2]))
         .round()
@@ -158,10 +154,10 @@ pub fn split_word_crops(crop: &RgbImage) -> Vec<RgbImage> {
 
     let radius = 3usize;
     let mut smooth = vec![0f32; w as usize];
-    for i in 0..w as usize {
+    for (i, value) in smooth.iter_mut().enumerate() {
         let start = i.saturating_sub(radius);
         let end = (i + radius + 1).min(w as usize);
-        smooth[i] = ink[start..end].iter().sum::<f32>() / (end - start) as f32;
+        *value = ink[start..end].iter().sum::<f32>() / (end - start) as f32;
     }
 
     let active_min = (h as f32 * 0.025).max(1.5);
@@ -304,9 +300,9 @@ mod tests {
         // 3 pasos de tiempo: t0="a", t1="a" (colapso), t2="b"
         // prob por clase: [blank, a, b, sp]
         let mut probs = vec![0.0f32; 3 * 4];
-        probs[0 * 4 + 1] = 0.9; // a
-        probs[1 * 4 + 1] = 0.9; // a (repite -> colapsa)
-        probs[2 * 4 + 2] = 0.8; // b
+        probs[1] = 0.9; // a
+        probs[5] = 0.9; // a (repite -> colapsa)
+        probs[10] = 0.8; // b
         let (text, conf) = c.ctc_decode(&probs, 3, 4);
         assert_eq!(text, "ab");
         // 0.9 (a) y 0.8 (b): la repetición de "a" colapsa sin sumar.
@@ -319,9 +315,9 @@ mod tests {
         // a, blank, b -> "ab"
         let mut probs = vec![0.0f32; 3 * 4];
         probs[0] = 0.0;
-        probs[0 * 4 + 1] = 0.9;
-        probs[1 * 4 + 0] = 0.9; // blank
-        probs[2 * 4 + 2] = 0.8;
+        probs[1] = 0.9;
+        probs[4] = 0.9; // blank
+        probs[10] = 0.8;
         let (text, _) = c.ctc_decode(&probs, 3, 4);
         assert_eq!(text, "ab");
     }
@@ -331,9 +327,9 @@ mod tests {
         // "aa" necesita blank en medio: a, blank, a
         let c = Charset::from_dict("a\nb\n");
         let mut probs = vec![0.0f32; 3 * 4];
-        probs[0 * 4 + 1] = 0.9;
-        probs[1 * 4 + 0] = 0.9;
-        probs[2 * 4 + 1] = 0.9;
+        probs[1] = 0.9;
+        probs[4] = 0.9;
+        probs[9] = 0.9;
         let (text, _) = c.ctc_decode(&probs, 3, 4);
         assert_eq!(text, "aa");
     }

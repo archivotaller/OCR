@@ -20,8 +20,7 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use tract_onnx::prelude::*;
 
-type Runnable =
-    RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
 /// Un modelo parseado + caché LRU acotada de planes compilados (por tamaño).
 struct Compiled {
@@ -85,11 +84,11 @@ impl Compiled {
             .infer
             .clone()
             .with_input_fact(0, f32::fact([1, 3, h as usize, w as usize]).into())
-            .context("fijando fact de entrada")?
+            .with_context(|| format!("{}: fijando fact de entrada {h}x{w}", self.label))?
             .into_optimized()
-            .context("optimizando")?
+            .with_context(|| format!("{}: optimizando plan {h}x{w}", self.label))?
             .into_runnable()
-            .context("compilando plan")?;
+            .with_context(|| format!("{}: compilando plan {h}x{w}", self.label))?;
         let plan = Arc::new(plan);
         cache.insert((h, w), plan.clone());
         Ok(plan)
@@ -140,27 +139,34 @@ pub struct Engine {
     charset: Charset,
     min_rec_score: f32,
     split_words: bool,
+    /// Pool dedicado cuando se pide un número de hilos concreto. `None` usa el
+    /// pool global de rayon (todos los núcleos lógicos).
+    pool: Option<rayon::ThreadPool>,
 }
 
 impl Engine {
     /// Carga los modelos del tier (descargándolos si hace falta) y prepara el
     /// motor. `model_dir` opcional sobreescribe la caché por defecto.
     pub fn load(cfg: &EngineConfig, model_dir: Option<&std::path::Path>) -> Result<Self> {
-        if cfg.threads > 0 {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(cfg.threads)
-                .build()
-                .context("creando pool rayon")?;
-            let _ = pool.install(|| {});
-        }
+        let pool = if cfg.threads > 0 {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(cfg.threads)
+                    .thread_name(|i| format!("octxt-{i}"))
+                    .build()
+                    .context("creando pool rayon")?,
+            )
+        } else {
+            None
+        };
         if let Some(dir) = model_dir {
             std::env::set_var("OCTXT_CACHE_DIR", dir);
         }
         let (det_path, rec_path) = models::ensure_tier(cfg.tier)?;
-        let det_onnx = std::fs::read(&det_path)
-            .with_context(|| format!("leyendo {}", det_path.display()))?;
-        let rec_onnx = std::fs::read(&rec_path)
-            .with_context(|| format!("leyendo {}", rec_path.display()))?;
+        let det_onnx =
+            std::fs::read(&det_path).with_context(|| format!("leyendo {}", det_path.display()))?;
+        let rec_onnx =
+            std::fs::read(&rec_path).with_context(|| format!("leyendo {}", rec_path.display()))?;
 
         let det = Compiled::from_bytes(cfg.tier.det_id(), &det_onnx, cfg.plan_cache_cap)?;
         let rec = Compiled::from_bytes(cfg.tier.rec_id(), &rec_onnx, cfg.plan_cache_cap)?;
@@ -173,6 +179,7 @@ impl Engine {
             charset,
             min_rec_score: cfg.min_rec_score,
             split_words: cfg.split_words,
+            pool,
         };
         if cfg.prewarm {
             engine.prewarm();
@@ -186,6 +193,14 @@ impl Engine {
             if let Err(e) = self.rec.plan_for(REC_HEIGHT, w) {
                 eprintln!("aviso: prewarm de rec w={w} falló: {e:#}");
             }
+        }
+    }
+
+    /// Número de hilos que usará el reconocimiento en paralelo.
+    pub fn pool_threads(&self) -> usize {
+        match &self.pool {
+            Some(pool) => pool.current_num_threads(),
+            None => rayon::current_num_threads(),
         }
     }
 
@@ -208,7 +223,13 @@ impl Engine {
             prob.len(),
             net_w * net_h
         );
-        Ok(db_postprocess(&prob, net_w, net_h, &pre, &self.det_cfg.params))
+        Ok(db_postprocess(
+            &prob,
+            net_w,
+            net_h,
+            &pre,
+            &self.det_cfg.params,
+        ))
     }
 
     fn recognize_strip_raw(&self, line: &image::RgbImage) -> Result<(String, f32)> {
@@ -287,28 +308,35 @@ impl Engine {
         });
 
         let src = img.to_rgb8();
-        // El reconocimiento es por-caja e independiente: en paralelo.
-        let lines: Vec<OcrLine> = boxes
-            .par_iter()
-            .map(|b| -> Result<Option<OcrLine>> {
-                let crop = rectify_crop(&src, &b.points, false);
-                let (text, rec_score) = self.recognize_strip(&crop)?;
-                Ok(if text.is_empty() || rec_score < self.min_rec_score {
-                    None
-                } else {
-                    Some(OcrLine {
-                        points: b.points,
-                        text,
-                        det_score: b.score,
-                        rec_score,
+        // El reconocimiento es por-caja e independiente: en paralelo. Si se
+        // configuró un pool dedicado (`--threads`), se ejecuta dentro de él.
+        let recognize = || -> Result<Vec<OcrLine>> {
+            let lines = boxes
+                .par_iter()
+                .map(|b| -> Result<Option<OcrLine>> {
+                    let crop = rectify_crop(&src, &b.points, false);
+                    let (text, rec_score) = self.recognize_strip(&crop)?;
+                    Ok(if text.is_empty() || rec_score < self.min_rec_score {
+                        None
+                    } else {
+                        Some(OcrLine {
+                            points: b.points,
+                            text,
+                            det_score: b.score,
+                            rec_score,
+                        })
                     })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            Ok(lines)
+        };
 
-        Ok(lines)
+        match &self.pool {
+            Some(pool) => pool.install(recognize),
+            None => recognize(),
+        }
     }
 }
