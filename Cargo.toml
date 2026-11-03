@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Utilidad OCR de escritorio basada en PP-OCRv6 (tract / 100% Rust): texto, JSON y PDF buscable con capa de texto invisible."
 license = "Apache-2.0"
+readme = "README.md"
 
 [lib]
 name = "octxt"
@@ -62,6 +63,10 @@ tiff = "0.11"
 tract-data = "0.21.17"
 tract-onnx = "0.21.17"
 ureq = "2"
+
+[dev-dependencies]
+# Para validar los PDF generados en los tests de integración.
+lopdf = { version = "0.44", default-features = false, features = ["chrono", "rayon", "embed_image"] }
 
 [profile.release]
 opt-level = 3
