@@ -292,6 +292,19 @@ fn vectorial_conserva_el_contenido_y_superpone_el_texto() {
 }
 
 #[test]
+fn se_pueden_abrir_varios_pdf_en_el_mismo_proceso() {
+    let src = temp_path("visible-vector-multi-src.pdf");
+    vector_pdf(&src);
+
+    // El enlace con PDFium solo puede crearse una vez por proceso; abrir otro
+    // PDF (o releer fuentes más tarde, como hace la GUI) debe reutilizarlo.
+    let first = PdfInput::open(&src, None).expect("primer PDF");
+    let second = PdfInput::open(&src, None).expect("segundo PDF");
+    assert_eq!(first.page_count().expect("páginas del primero"), 1);
+    assert_eq!(second.page_count().expect("páginas del segundo"), 1);
+}
+
+#[test]
 fn pdf_rotado_90_conserva_la_rotacion_y_fuerza_overlay() {
     let src = temp_path("visible-vector-rot90-src.pdf");
     vector_pdf_rotated(&src, 90);

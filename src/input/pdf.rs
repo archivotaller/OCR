@@ -60,10 +60,29 @@ pub struct PdfInput {
     password: Option<String>,
 }
 
+/// Enlaza con el PDFium embebido reutilizando el enlace si ya existe.
+///
+/// `pdfium-render` solo permite enlazar una vez por proceso: a partir de la
+/// segunda llamada devuelve `PdfiumLibraryBindingsAlreadyInitialized`, que aquí
+/// se traduce en una instancia que usa el enlace global ya creado. Esto permite
+/// abrir varios PDF en la misma ejecución y volver a leer fuentes más tarde sin
+/// reiniciar el proceso.
+fn bind_bundled_once() -> Result<Pdfium> {
+    let path = pdfium_bundled::ensure_pdfium_bundled()
+        .map_err(|e| anyhow!("no se pudo preparar PDFium embebido: {e}"))?;
+    match Pdfium::bind_to_library(&path) {
+        Ok(bindings) => Ok(Pdfium::new(bindings)),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(Pdfium::default()),
+        Err(e) => Err(anyhow!(
+            "no se pudo cargar PDFium embebido desde {}: {e}",
+            path.display()
+        )),
+    }
+}
+
 impl PdfInput {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
-        let pdfium = pdfium_bundled::bind_bundled()
-            .map_err(|e| anyhow!("no se pudo cargar PDFium embebido: {e}"))?;
+        let pdfium = bind_bundled_once()?;
         Ok(PdfInput {
             pdfium,
             path: path.to_path_buf(),
