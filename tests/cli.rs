@@ -42,6 +42,88 @@ fn version_y_help_funcionan_sin_modelos() {
 }
 
 #[test]
+fn pdf_help_lista_las_opciones_de_reemplazo() {
+    let bin = env!("CARGO_BIN_EXE_octxt");
+    let help = Command::new(bin)
+        .args(["pdf", "--help"])
+        .output()
+        .expect("ejecutar pdf --help");
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    for flag in [
+        "--replace-text",
+        "--erase-mode",
+        "--erase-margin",
+        "--background",
+        "--text-color",
+        "--font-cjk",
+        "--exclude",
+    ] {
+        assert!(text.contains(flag), "pdf --help debe listar {flag}");
+    }
+}
+
+#[test]
+fn pdf_valida_colores_y_exclusiones_antes_del_ocr() {
+    let bin = env!("CARGO_BIN_EXE_octxt");
+    let img = fixture("eurotext.tif");
+
+    let out = Command::new(bin)
+        .args(["pdf", "--replace-text", "--background", "no-es-color"])
+        .arg(&img)
+        .output()
+        .expect("ejecutar con color inválido");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("color no válido"));
+
+    let out = Command::new(bin)
+        .args(["pdf", "--replace-text", "--exclude", "0:1"])
+        .arg(&img)
+        .output()
+        .expect("ejecutar con exclusión inválida");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("empiezan en 1"));
+}
+
+#[test]
+#[ignore = "genera un PDF visible completo con OCR; ejecutar a mano con --ignored"]
+fn pdf_replace_text_fixture() {
+    let bin = env!("CARGO_BIN_EXE_octxt");
+    let dir = temp_dir();
+    let img = fixture("eurotext.tif");
+    let out_pdf = dir.join("eurotext.visible.pdf");
+
+    let out = Command::new(bin)
+        .args([
+            "--tier",
+            &tier(),
+            "--no-prewarm",
+            "pdf",
+            "--replace-text",
+            "--out",
+        ])
+        .arg(&out_pdf)
+        .arg(&img)
+        .output()
+        .expect("ejecutar octxt pdf --replace-text");
+    assert!(
+        out.status.success(),
+        "octxt pdf --replace-text falló: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let doc = lopdf::Document::load(&out_pdf).expect("lopdf debe abrir el PDF visible");
+    assert_eq!(doc.get_pages().len(), 1);
+    let page_id = *doc.get_pages().values().next().unwrap();
+    let content = doc.get_page_content(page_id);
+    let text = String::from_utf8_lossy(&content);
+    assert!(text.contains("Tj"), "falta el texto visible");
+    let raw = std::fs::read(&out_pdf).expect("leer el PDF");
+    let raw = String::from_utf8_lossy(&raw);
+    assert!(raw.contains("FontFile2"), "falta la fuente incrustada");
+}
+
+#[test]
 fn cli_txt_json_y_pdf_sobre_fixture() {
     let bin = env!("CARGO_BIN_EXE_octxt");
     let dir = temp_dir();
