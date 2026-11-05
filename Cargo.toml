@@ -1,8 +1,8 @@
 [package]
 name = "octxt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Utilidad OCR de escritorio basada en PP-OCRv6 (tract / 100% Rust): texto, JSON y PDF buscable con capa de texto invisible."
+description = "OCR de escritorio basado en PP-OCRv6 (tract / 100% Rust): texto, JSON, PDF buscable y PDF con texto visible reemplazado."
 license = "Apache-2.0"
 readme = "README.md"
 
