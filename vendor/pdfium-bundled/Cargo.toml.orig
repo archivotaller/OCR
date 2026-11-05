@@ -1,0 +1,73 @@
+[package]
+name = "pdfium-bundled"
+version = "0.2.0+pdfium-8066"
+edition = "2024"
+rust-version = "1.88"
+authors      = ["C J Silverio <ceejceej@gmail.com>"]
+description  = "Auto-download and cache PDFium binaries — zero-friction setup for pdfium-render"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/ceejbot/pdfium-bundled"
+keywords     = ["pdfium", "pdfium-render", "pdf", "ffi", "bundled"]
+categories   = ["external-ffi-bindings", "rendering"]
+readme       = "README.md"
+exclude      = [".github", ".justfile", ".rustfmt.toml"]
+
+# Document the bundled-only API (bind_bundled, ensure_pdfium_bundled) on
+# docs.rs. build.rs stubs the embed under the DOCS_RS env var so this build
+# succeeds in the network-isolated docs sandbox.
+[package.metadata.docs.rs]
+features = ["bundled"]
+
+[dependencies]
+etcetera = "0.11.0"
+flate2       = "1"
+pdfium-render = { version = "0.9", features = ["pdfium_latest", "image_latest", "thread_safe"] }
+# Verifies every downloaded archive and every loaded library against the
+# digests pinned in src/platform.rs. Also a build-dependency: build.rs shares
+# src/integrity.rs via include! and checks the embedded library the same way.
+sha2         = "0.11"
+tar          = "0.4"
+thiserror    = "2"
+# Dead-simple blocking HTTP client. rustls default pulls ring + bundled
+# webpki-roots (no cmake, portable); default-features=false drops ureq's
+# transparent gzip decoding so our own gzip/tar extractor sees raw .tgz bytes.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[build-dependencies]
+flate2 = "1"
+sha2   = "0.11"
+tar    = "0.4"
+
+[features]
+# Embed the pdfium dylib inside the Rust binary at compile time.
+#
+# When this feature is active, `build.rs` embeds the platform pdfium library
+# into the binary via `include_bytes!`. On first run the bytes are extracted
+# to the cache directory and the library is loaded from there.
+#
+# Build-time library resolution (first match wins):
+#
+#   1. PDFIUM_BUNDLE_LIB=/path/to/libpdfium  — set explicitly (CI / air-gapped)
+#   2. Auto-download from bblanchon/pdfium-binaries via `curl`
+#
+# Auto-downloaded archives are cached in:
+#   {$CARGO_HOME}/pdfium-bundled/{VERSION}/{TARGET_OS}-{TARGET_ARCH}/
+#
+# The resulting binary is fully self-contained: no internet access or
+# pre-installed shared library is required at runtime.
+bundled = []
+
+[lints.rust]
+unsafe_code = "deny"
+# Lint groups take a lower priority so specific lints below can override their
+# members (Cargo applies lints in ascending priority; later wins).
+future_incompatible = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+trivial_casts = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+# Prefer expect() over unwrap() everywhere, including tests, so failures carry
+# a message. (expect_used is intentionally left enabled.)
+unwrap_used = "deny"

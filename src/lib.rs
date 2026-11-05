@@ -12,6 +12,7 @@ pub mod dict;
 pub mod font;
 pub mod geom;
 pub mod image_io;
+pub mod input;
 pub mod models;
 pub mod ocr;
 pub mod output;
