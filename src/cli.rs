@@ -2,11 +2,14 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use octxt::font::FontSpec;
 use octxt::image_io;
+use octxt::input::pdf::PdfInput;
 use octxt::models::{self, Tier};
 use octxt::ocr::config::{DetConfig, DetParams};
 use octxt::ocr::engine::{Engine, EngineConfig};
 use octxt::output::{common::FileResult, json, txt};
+use octxt::replace::{PageContent, ReplaceOptions, Rgb};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -70,7 +73,8 @@ pub struct Cli {
 pub enum Command {
     /// Extrae el texto (stdout, archivo único o un .txt por imagen).
     Txt(TxtArgs),
-    /// Genera un PDF buscable con capa de texto invisible.
+    /// Genera un PDF buscable con capa de texto invisible; con --replace-text,
+    /// un PDF con el texto original borrado y el del OCR visible y editable.
     Pdf(PdfArgs),
     /// Lista las cajas detectadas con texto y confianza (JSON o TSV).
     Boxes(BoxesArgs),
@@ -109,7 +113,7 @@ pub struct TxtArgs {
 
 #[derive(Args)]
 pub struct PdfArgs {
-    /// Imágenes o directorios a procesar.
+    /// Imágenes, PDF o directorios a procesar.
     #[arg(required = true)]
     pub paths: Vec<PathBuf>,
 
@@ -117,13 +121,78 @@ pub struct PdfArgs {
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
 
-    /// Archivo PDF único (solo con una imagen de entrada).
+    /// Archivo PDF único (solo con una entrada).
     #[arg(long, conflicts_with = "out_dir")]
     pub out: Option<PathBuf>,
 
     /// Recorre directorios recursivamente.
     #[arg(long)]
     pub recursive: bool,
+
+    /// Genera la variante con texto visible: borra el original y escribe
+    /// encima el texto del OCR (buscable y editable).
+    #[arg(long)]
+    pub replace_text: bool,
+
+    /// Cómo se elimina el texto original.
+    #[arg(long, value_enum, default_value_t = EraseArg::Real)]
+    pub erase_mode: EraseArg,
+
+    /// Margen alrededor de cada caja, como fracción de su altura.
+    #[arg(long, default_value_t = 0.3)]
+    pub erase_margin: f32,
+
+    /// Color de fondo fijo (`#rrggbb`) o `auto` (muestreado por caja).
+    #[arg(long, default_value = "auto")]
+    pub background: String,
+
+    /// Color del texto fijo (`#rrggbb`) o `auto` (contraste con el fondo).
+    #[arg(long, default_value = "auto")]
+    pub text_color: String,
+
+    /// Fuente TTF/OTF para latín (por defecto, Noto Sans incluida).
+    #[arg(long)]
+    pub font: Option<PathBuf>,
+
+    /// Índice dentro de una colección TTC para `--font`.
+    #[arg(long, default_value_t = 0)]
+    pub font_index: u32,
+
+    /// Fuente CJK explícita (por defecto se busca una en el sistema).
+    #[arg(long)]
+    pub font_cjk: Option<PathBuf>,
+
+    /// Índice dentro de una colección TTC para `--font-cjk`.
+    #[arg(long, default_value_t = 0)]
+    pub font_cjk_index: u32,
+
+    /// Usa la fuente incluida con serifa en lugar de la sans.
+    #[arg(long)]
+    pub font_serif: bool,
+
+    /// Resolución de rasterizado de los PDF de entrada.
+    #[arg(long, default_value_t = 300.0)]
+    pub dpi: f32,
+
+    /// Cajas que no se reemplazan, con formato `página:línea` (1-based).
+    #[arg(long, value_delimiter = ',')]
+    pub exclude: Vec<String>,
+}
+
+/// Modo de borrado en la CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EraseArg {
+    Real,
+    Visual,
+}
+
+impl From<EraseArg> for octxt::replace::EraseMode {
+    fn from(v: EraseArg) -> Self {
+        match v {
+            EraseArg::Real => octxt::replace::EraseMode::Real,
+            EraseArg::Visual => octxt::replace::EraseMode::Visual,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -431,18 +500,52 @@ fn run_boxes(engine: &Engine, a: &BoxesArgs) -> Result<()> {
 }
 
 fn run_pdf(engine: &Engine, a: &PdfArgs) -> Result<()> {
-    let files = expand_inputs(&a.paths, a.recursive)?;
+    let files = expand_pdf_inputs(&a.paths, a.recursive)?;
     if files.is_empty() {
-        bail!("no se encontraron imágenes");
+        bail!("no se encontraron imágenes ni PDF");
     }
     if a.out.is_some() && files.len() != 1 {
-        bail!("--out solo es válido con una única imagen de entrada");
+        bail!("--out solo es válido con una única entrada");
     }
     if let Some(dir) = &a.out_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("creando {}", dir.display()))?;
     }
 
+    let opts = build_replace_options(a)?;
+
     for f in &files {
+        let out_path = output_path(f, a);
+        if a.replace_text {
+            let (pages, original) = prepare_pages(engine, f, a)?;
+            if pages.is_empty() {
+                continue;
+            }
+            let plan = octxt::replace::build(&pages, &opts)?;
+            report_plan(&plan);
+            octxt::output::visible::write_visible_pdf(
+                original.as_deref(),
+                &pages,
+                &plan,
+                opts.mode,
+                &out_path,
+            )?;
+            eprintln!(
+                "✓ {} ({} líneas reemplazadas, {} omitidas, {} con overlay)",
+                out_path.display(),
+                plan.erased_lines(),
+                plan.skipped_lines(),
+                plan.overlay_pages()
+            );
+            continue;
+        }
+
+        if is_pdf(f) {
+            bail!(
+                "'{}' es un PDF: añade --replace-text para generar la versión con texto visible",
+                f.display()
+            );
+        }
+
         let orig_bytes = std::fs::read(f).ok();
         let imgs = image_io::load_images(f)?;
         if imgs.is_empty() {
@@ -466,22 +569,6 @@ fn run_pdf(engine: &Engine, a: &PdfArgs) -> Result<()> {
             lines_per_page.push(lines);
         }
 
-        let out_path = if let Some(out) = &a.out {
-            out.clone()
-        } else if let Some(dir) = &a.out_dir {
-            let stem = f
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "imagen".to_string());
-            dir.join(format!("{stem}.pdf"))
-        } else {
-            let stem = f
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "imagen".to_string());
-            f.with_file_name(format!("{stem}.pdf"))
-        };
-
         let pages: Vec<octxt::output::pdf::PdfPage<'_>> = imgs
             .iter()
             .enumerate()
@@ -497,6 +584,221 @@ fn run_pdf(engine: &Engine, a: &PdfArgs) -> Result<()> {
             .collect();
         octxt::output::pdf::searchable_pdf_pages(&pages, &out_path)?;
         eprintln!("✓ {}", out_path.display());
+    }
+    Ok(())
+}
+
+/// Ruta de salida para una entrada (sufijo `.visible.pdf` en modo reemplazo).
+fn output_path(f: &Path, a: &PdfArgs) -> PathBuf {
+    if let Some(out) = &a.out {
+        return out.clone();
+    }
+    let stem = f
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "salida".to_string());
+    let name = if a.replace_text {
+        format!("{stem}.visible.pdf")
+    } else {
+        format!("{stem}.pdf")
+    };
+    match &a.out_dir {
+        Some(dir) => dir.join(name),
+        None => f.with_file_name(name),
+    }
+}
+
+fn build_replace_options(a: &PdfArgs) -> Result<ReplaceOptions> {
+    let background = parse_color_arg("--background", &a.background)?;
+    let text_color = parse_color_arg("--text-color", &a.text_color)?;
+    let excluded = parse_excluded(&a.exclude)?;
+    Ok(ReplaceOptions {
+        mode: a.erase_mode.into(),
+        margin: a.erase_margin,
+        background,
+        text_color,
+        font: FontSpec {
+            latin: a.font.clone(),
+            latin_index: a.font_index,
+            cjk_index: a.font_cjk_index,
+            serif: a.font_serif,
+            cjk: a.font_cjk.clone(),
+            extra: Vec::new(),
+        },
+        dpi: a.dpi.max(36.0),
+        excluded,
+    })
+}
+
+fn parse_color_arg(flag: &str, value: &str) -> Result<Option<Rgb>> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    Rgb::parse(value)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("{flag}: color no válido '{value}' (usa #rrggbb o auto)"))
+}
+
+/// Convierte `página:línea` (1-based) en índices 0-based.
+fn parse_excluded(specs: &[String]) -> Result<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let (p, l) = spec.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("--exclude: formato esperado página:línea, no '{spec}'")
+        })?;
+        let page: usize = p
+            .trim()
+            .parse()
+            .with_context(|| format!("--exclude: página no válida en '{spec}'"))?;
+        let line: usize = l
+            .trim()
+            .parse()
+            .with_context(|| format!("--exclude: línea no válida en '{spec}'"))?;
+        if page == 0 || line == 0 {
+            bail!("--exclude: la página y la línea empiezan en 1 ('{spec}')");
+        }
+        out.push((page - 1, line - 1));
+    }
+    Ok(out)
+}
+
+/// Rasteriza y hace OCR de una entrada (imágenes/TIFF o PDF).
+fn prepare_pages(
+    engine: &Engine,
+    f: &Path,
+    a: &PdfArgs,
+) -> Result<(Vec<PageContent>, Option<PathBuf>)> {
+    if is_pdf(f) {
+        let input = PdfInput::open(f, None)?;
+        let count = input.page_count()?;
+        let mut pages = Vec::with_capacity(count);
+        for idx in 0..count {
+            let t0 = Instant::now();
+            let raster = input.rasterize(idx, a.dpi)?;
+            let lines = engine.ocr(&raster.image)?;
+            let source_fonts = input.source_fonts(idx, &raster, &lines)?;
+            eprintln!(
+                "{}: página {}/{}: {} líneas en {} ms{}",
+                f.display(),
+                idx + 1,
+                count,
+                lines.len(),
+                t0.elapsed().as_millis(),
+                if raster.scanned { " (escaneada)" } else { "" }
+            );
+            pages.push(PageContent {
+                image: raster.image,
+                to_page: raster.to_page,
+                width_pt: raster.width_pt,
+                height_pt: raster.height_pt,
+                rotation: raster.rotation,
+                scanned: raster.scanned,
+                from_pdf: true,
+                source_fonts,
+                lines,
+            });
+        }
+        Ok((pages, Some(f.to_path_buf())))
+    } else {
+        let imgs = image_io::load_images(f)?;
+        let total = imgs.len();
+        let mut pages = Vec::with_capacity(total);
+        for (idx, img) in imgs.into_iter().enumerate() {
+            let t0 = Instant::now();
+            let lines = engine.ocr(&img)?;
+            eprintln!(
+                "{}: página {}/{}: {} líneas en {} ms",
+                f.display(),
+                idx + 1,
+                total,
+                lines.len(),
+                t0.elapsed().as_millis()
+            );
+            let mut page = PageContent::from_image(img);
+            page.lines = lines;
+            pages.push(page);
+        }
+        Ok((pages, None))
+    }
+}
+
+fn report_plan(plan: &octxt::replace::Plan) {
+    for page in &plan.pages {
+        let kind = if page.overlay {
+            "overlay (vectores conservados)"
+        } else {
+            "raster"
+        };
+        eprintln!(
+            "  página {}: {} líneas reemplazadas, {} omitidas · {}",
+            page.page + 1,
+            page.lines.len(),
+            page.skipped.len(),
+            kind
+        );
+        for skip in &page.skipped {
+            let preview: String = skip.text.chars().take(48).collect();
+            eprintln!(
+                "    línea {}: {} — «{}»",
+                skip.line + 1,
+                skip.reason,
+                preview.trim()
+            );
+        }
+        if page.non_uniform {
+            eprintln!("    aviso: el fondo no es uniforme; se usa el color dominante");
+        }
+    }
+}
+
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+}
+
+/// Expande entradas aceptando tanto imágenes como PDF.
+fn expand_pdf_inputs(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            collect_dir_pdf(p, recursive, &mut out)?;
+        } else if p.exists() {
+            if !image_io::has_image_ext(p) && !is_pdf(p) {
+                eprintln!(
+                    "aviso: ignorando '{}' (extensión no soportada)",
+                    p.display()
+                );
+                continue;
+            }
+            out.push(p.clone());
+        } else {
+            bail!("no existe: {}", p.display());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn collect_dir_pdf(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("leyendo directorio {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            if recursive {
+                collect_dir_pdf(&path, true, out)?;
+            }
+        } else if ft.is_file() && (image_io::has_image_ext(&path) || is_pdf(&path)) {
+            out.push(path);
+        }
     }
     Ok(())
 }
