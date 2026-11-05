@@ -1387,6 +1387,24 @@ impl OcrtApp {
             }
         }
 
+        if let Some(i) = self.selected {
+            let source = self
+                .docs
+                .get(self.doc)
+                .and_then(|d| d.source_fonts.get(self.page))
+                .and_then(|s| s.as_ref())
+                .and_then(|v| v.get(i))
+                .and_then(|s| s.as_ref())
+                .map(SourceFont::describe);
+            if let Some(s) = source {
+                ui.separator();
+                ui.weak(format!("Fuente de origen: {s}"));
+                ui.weak(
+                    "Se usa para el tamaño y la línea base; el texto nuevo usa la fuente elegida.",
+                );
+            }
+        }
+
         let has = self.docs.iter().any(Doc::has_results);
         if ui
             .add_enabled(
@@ -1426,7 +1444,21 @@ impl OcrtApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, line) in lines.iter().enumerate() {
-                let tb = format!("det {:.2} · rec {:.2}", line.det_score, line.rec_score);
+                let source = self
+                    .docs
+                    .get(self.doc)
+                    .and_then(|d| d.source_fonts.get(self.page))
+                    .and_then(|s| s.as_ref())
+                    .and_then(|v| v.get(i))
+                    .and_then(|s| s.as_ref())
+                    .map(SourceFont::describe);
+                let tb = match source {
+                    Some(s) => format!(
+                        "det {:.2} · rec {:.2} · fuente original: {s}",
+                        line.det_score, line.rec_score
+                    ),
+                    None => format!("det {:.2} · rec {:.2}", line.det_score, line.rec_score),
+                };
                 let text = if line.text.trim().is_empty() {
                     "(vacío)".to_string()
                 } else {

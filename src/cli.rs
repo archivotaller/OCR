@@ -749,6 +749,16 @@ fn report_plan(plan: &octxt::replace::Plan) {
                 preview.trim()
             );
         }
+        let mut fuentes: Vec<String> = page
+            .lines
+            .iter()
+            .filter_map(|l| l.source.as_ref().map(|s| s.describe()))
+            .collect();
+        fuentes.sort();
+        fuentes.dedup();
+        if !fuentes.is_empty() {
+            eprintln!("    fuente original: {}", fuentes.join(" · "));
+        }
         if page.non_uniform {
             eprintln!("    aviso: el fondo no es uniforme; se usa el color dominante");
         }

@@ -206,6 +206,10 @@ Cómo se comporta:
   geometría de la página.
 - Si una caja tiene fondo no uniforme se rellena con un color sólido muestreado
   del entorno; el informe lo indica.
+- El informe y la GUI muestran la **fuente de origen** de cada línea (familia,
+  estilo y tamaño). Esa fuente se usa para calcular tamaño y línea base; el
+  texto nuevo se escribe con la fuente elegida (`--font`, `--font-serif` o
+  `--font-cjk`, o los botones equivalentes de la GUI).
 - Si un carácter no existe en la fuente elegida ni en las de reserva, esa línea
   **no se borra** y se reporta en lugar de escribir texto incompleto.
 
