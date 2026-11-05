@@ -1,15 +1,20 @@
 //! octxt-gui: interfaz de escritorio del OCR (eframe/egui 0.35).
 //!
-//! - Abre imágenes, TIFF multipágina o carpetas completas (botón o arrastrando).
+//! - Abre imágenes, TIFF multipágina, PDF o carpetas completas (botón o arrastrando).
 //! - Carga el motor y ejecuta el OCR en un hilo aparte: la interfaz no se bloquea.
 //! - Procesa una página, un documento entero o todos los documentos en cola.
-//! - Exporta TXT / JSON y PDF buscable de todas las páginas.
+//! - Exporta TXT / JSON, PDF buscable y PDF con el texto visible reemplazado.
 
+use octxt::font::FontSpec;
+use octxt::geom::{point_in_quad, Affine};
 use octxt::image_io;
+use octxt::input::pdf::{PageRaster, PdfInput, SourceFont};
 use octxt::models::Tier;
 use octxt::ocr::engine::{Engine, EngineConfig, OcrLine};
 use octxt::output::{common::FileResult, json, pdf, txt};
-use std::collections::VecDeque;
+use octxt::replace::{self, EraseMode, PageContent, ReplaceOptions, Rgb};
+use std::collections::{HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -73,29 +78,147 @@ enum WorkerEvt {
     },
 }
 
-/// Un documento abierto (una imagen suelta o un TIFF multipágina).
+/// Raster de una página con su geometría de página.
+struct PageData {
+    image: image::DynamicImage,
+    /// Píxeles del raster -> puntos de la página.
+    to_page: Affine,
+    width_pt: f32,
+    height_pt: f32,
+    /// Rotación intrínseca del PDF (0/90/180/270).
+    rotation: u16,
+    /// Página sin texto ni vectores: solo una imagen escaneada.
+    scanned: bool,
+    /// `true` si la página viene de un PDF existente.
+    from_pdf: bool,
+}
+
+impl PageData {
+    fn from_image(image: image::DynamicImage) -> Self {
+        let (w, h) = (image.width(), image.height());
+        PageData {
+            image,
+            to_page: Affine::image_to_page(w, h, w as f32, h as f32),
+            width_pt: w as f32,
+            height_pt: h as f32,
+            rotation: 0,
+            scanned: false,
+            from_pdf: false,
+        }
+    }
+
+    fn from_raster(raster: PageRaster) -> Self {
+        PageData {
+            image: raster.image,
+            to_page: raster.to_page,
+            width_pt: raster.width_pt,
+            height_pt: raster.height_pt,
+            rotation: raster.rotation,
+            scanned: raster.scanned,
+            from_pdf: true,
+        }
+    }
+
+    fn raster(&self) -> PageRaster {
+        PageRaster {
+            image: self.image.clone(),
+            to_page: self.to_page,
+            width_pt: self.width_pt,
+            height_pt: self.height_pt,
+            rotation: self.rotation,
+            scanned: self.scanned,
+        }
+    }
+}
+
+/// Un documento abierto (una imagen suelta, un TIFF multipágina o un PDF).
 struct Doc {
     path: PathBuf,
-    pages: Vec<image::DynamicImage>,
+    pages: Vec<PageData>,
     results: Vec<Vec<OcrLine>>,
     elapsed_ms: Vec<u128>,
     orig_bytes: Option<Vec<u8>>,
+    /// Cajas excluidas del reemplazo, por página.
+    excluded: Vec<HashSet<usize>>,
+    /// Fuentes de origen por línea (solo PDF con texto).
+    source_fonts: Vec<Option<Vec<Option<SourceFont>>>>,
+    /// Se incrementa con cada cambio que afecta a la vista previa.
+    revision: u64,
 }
 
 impl Doc {
-    fn from_path(path: &Path) -> anyhow::Result<Self> {
-        let pages = image_io::load_images(path)?;
+    fn from_path(path: &Path, dpi: f32) -> anyhow::Result<Self> {
+        let pages: Vec<PageData> = if is_pdf(path) {
+            let input = PdfInput::open(path, None)?;
+            let count = input.page_count()?;
+            let mut pages = Vec::with_capacity(count);
+            for idx in 0..count {
+                pages.push(PageData::from_raster(input.rasterize(idx, dpi)?));
+            }
+            pages
+        } else {
+            image_io::load_images(path)?
+                .into_iter()
+                .map(PageData::from_image)
+                .collect()
+        };
+        let n = pages.len();
         Ok(Doc {
             path: path.to_path_buf(),
-            results: vec![Vec::new(); pages.len()],
-            elapsed_ms: vec![0; pages.len()],
+            results: vec![Vec::new(); n],
+            elapsed_ms: vec![0; n],
             orig_bytes: std::fs::read(path).ok(),
+            excluded: vec![HashSet::new(); n],
+            source_fonts: vec![None; n],
             pages,
+            revision: 0,
         })
     }
 
     fn line_count(&self) -> usize {
         self.results.iter().map(|l| l.len()).sum()
+    }
+
+    /// ¿Alguna página tiene resultados de OCR?
+    fn has_results(&self) -> bool {
+        self.results.iter().any(|l| !l.is_empty())
+    }
+
+    /// Contenido de una página listo para planificar el reemplazo.
+    fn page_content(&self, page: usize) -> Option<PageContent> {
+        let p = self.pages.get(page)?;
+        Some(PageContent {
+            image: p.image.clone(),
+            to_page: p.to_page,
+            width_pt: p.width_pt,
+            height_pt: p.height_pt,
+            rotation: p.rotation,
+            scanned: p.scanned,
+            from_pdf: p.from_pdf,
+            source_fonts: self
+                .source_fonts
+                .get(page)
+                .and_then(|s| s.clone())
+                .unwrap_or_default(),
+            lines: self.results.get(page).cloned().unwrap_or_default(),
+        })
+    }
+
+    /// Lee del PDF la fuente, la caja y la línea base de cada línea OCR.
+    fn refresh_source_fonts(&mut self, page: usize) -> anyhow::Result<()> {
+        let Some(data) = self.pages.get(page) else {
+            return Ok(());
+        };
+        if !data.from_pdf {
+            return Ok(());
+        }
+        let input = PdfInput::open(&self.path, None)?;
+        let fonts = input.source_fonts(page, &data.raster(), &self.results[page])?;
+        if let Some(slot) = self.source_fonts.get_mut(page) {
+            *slot = Some(fonts);
+        }
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
     }
 }
 
@@ -110,6 +233,82 @@ enum EngineState {
     Loading,
     Ready,
     Failed,
+}
+
+/// Herramienta activa sobre la vista del documento.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Eyedropper {
+    Off,
+    Background,
+    Text,
+}
+
+/// Opciones del reemplazo visibles en el panel lateral.
+struct ReplaceUi {
+    enabled: bool,
+    mode: EraseMode,
+    margin: f32,
+    /// `None` = automático por caja.
+    background: Option<Rgb>,
+    /// `None` = automático por caja.
+    text_color: Option<Rgb>,
+    serif: bool,
+    latin: Option<PathBuf>,
+    latin_index: u32,
+    cjk: Option<PathBuf>,
+    cjk_index: u32,
+    dpi: f32,
+    show_preview: bool,
+    eyedropper: Eyedropper,
+    exclude_mode: bool,
+}
+
+impl Default for ReplaceUi {
+    fn default() -> Self {
+        ReplaceUi {
+            enabled: false,
+            mode: EraseMode::Real,
+            margin: 0.3,
+            background: None,
+            text_color: None,
+            serif: false,
+            latin: None,
+            latin_index: 0,
+            cjk: None,
+            cjk_index: 0,
+            dpi: 200.0,
+            show_preview: true,
+            eyedropper: Eyedropper::Off,
+            exclude_mode: false,
+        }
+    }
+}
+
+impl ReplaceUi {
+    fn options(&self, excluded: Vec<(usize, usize)>) -> ReplaceOptions {
+        ReplaceOptions {
+            mode: self.mode,
+            margin: self.margin,
+            background: self.background,
+            text_color: self.text_color,
+            font: FontSpec {
+                latin: self.latin.clone(),
+                latin_index: self.latin_index,
+                cjk_index: self.cjk_index,
+                serif: self.serif,
+                cjk: self.cjk.clone(),
+                extra: Vec::new(),
+            },
+            dpi: self.dpi.max(36.0),
+            excluded,
+        }
+    }
+}
+
+/// Plan de la página actual, recalculado solo cuando cambia algo relevante.
+struct PreviewCache {
+    key: u64,
+    plan: replace::Plan,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +341,9 @@ struct OcrtApp {
     in_flight: Option<(usize, usize)>,
     /// Páginas del lote actual (para el resumen final).
     queued_total: usize,
+
+    replace: ReplaceUi,
+    preview: Option<PreviewCache>,
 }
 
 impl OcrtApp {
@@ -163,12 +365,14 @@ impl OcrtApp {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             selected: None,
-            status: "Arrastra imágenes o usa 'Abrir…' / 'Carpeta…'.".into(),
+            status: "Arrastra imágenes o PDF, o usa 'Abrir…' / 'Carpeta…'.".into(),
             drop_hover: false,
             auto_ocr,
             queue: VecDeque::new(),
             in_flight: None,
             queued_total: 0,
+            replace: ReplaceUi::default(),
+            preview: None,
         };
         app.request_engine_load();
         if !paths.is_empty() {
@@ -190,7 +394,7 @@ impl OcrtApp {
         self.docs.get(self.doc)
     }
 
-    fn current_pages(&self) -> &[image::DynamicImage] {
+    fn current_pages(&self) -> &[PageData] {
         self.current_doc()
             .map(|d| d.pages.as_slice())
             .unwrap_or(&[])
@@ -222,7 +426,7 @@ impl OcrtApp {
                 last = Some(i);
                 continue;
             }
-            match Doc::from_path(&path) {
+            match Doc::from_path(&path, self.replace.dpi) {
                 Ok(doc) => {
                     self.docs.push(doc);
                     last = Some(self.docs.len() - 1);
@@ -285,7 +489,7 @@ impl OcrtApp {
             self.texture = None;
             return;
         };
-        let Some(img) = doc.pages.get(self.page) else {
+        let Some(img) = doc.pages.get(self.page).map(|p| &p.image) else {
             self.texture = None;
             return;
         };
@@ -380,7 +584,12 @@ impl OcrtApp {
         let Some((doc, page)) = self.queue.pop_front() else {
             return;
         };
-        let Some(image) = self.docs.get(doc).and_then(|d| d.pages.get(page)).cloned() else {
+        let Some(image) = self
+            .docs
+            .get(doc)
+            .and_then(|d| d.pages.get(page))
+            .map(|p| p.image.clone())
+        else {
             return;
         };
         if self
@@ -442,11 +651,19 @@ impl OcrtApp {
                     lines,
                     elapsed_ms,
                 }) => {
+                    let mut fonts_error = None;
                     if let Some(d) = self.docs.get_mut(doc) {
                         if page < d.results.len() {
                             d.results[page] = lines;
                             d.elapsed_ms[page] = elapsed_ms;
+                            d.revision = d.revision.wrapping_add(1);
+                            if let Err(e) = d.refresh_source_fonts(page) {
+                                fonts_error = Some(e);
+                            }
                         }
+                    }
+                    if let Some(e) = fonts_error {
+                        eprintln!("aviso: no se pudieron leer las fuentes del PDF: {e:#}");
                     }
                     if self.in_flight == Some((doc, page)) {
                         self.in_flight = None;
@@ -497,7 +714,7 @@ impl OcrtApp {
 
     fn file_result(&self, doc: usize, page: usize) -> Option<FileResult> {
         let d = self.docs.get(doc)?;
-        let img = d.pages.get(page)?;
+        let img = &d.pages.get(page)?.image;
         let lines = d.results.get(page)?;
         let file = if d.pages.len() > 1 {
             format!("{}#p{}", d.path.display(), page + 1)
@@ -634,6 +851,165 @@ impl OcrtApp {
             )
         };
     }
+
+    // --- Reemplazo de texto ----------------------------------------------
+
+    fn preview_key(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.doc.hash(&mut h);
+        self.page.hash(&mut h);
+        let Some(doc) = self.docs.get(self.doc) else {
+            return h.finish();
+        };
+        doc.revision.hash(&mut h);
+        self.replace.enabled.hash(&mut h);
+        self.replace.mode.label().hash(&mut h);
+        self.replace.margin.to_bits().hash(&mut h);
+        self.replace.background.hash(&mut h);
+        self.replace.text_color.hash(&mut h);
+        self.replace.serif.hash(&mut h);
+        self.replace.latin.hash(&mut h);
+        self.replace.latin_index.hash(&mut h);
+        self.replace.cjk.hash(&mut h);
+        self.replace.cjk_index.hash(&mut h);
+        let mut excluded: Vec<usize> = doc
+            .excluded
+            .get(self.page)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        excluded.sort_unstable();
+        excluded.hash(&mut h);
+        h.finish()
+    }
+
+    /// Calcula (o reutiliza) el plan de la página actual para la vista previa.
+    fn ensure_preview(&mut self) {
+        if !self.replace.enabled || !self.replace.show_preview {
+            self.preview = None;
+            return;
+        }
+        let key = self.preview_key();
+        if self.preview.as_ref().map(|p| p.key) == Some(key) {
+            return;
+        }
+        let Some(doc) = self.docs.get(self.doc) else {
+            self.preview = None;
+            return;
+        };
+        if doc
+            .results
+            .get(self.page)
+            .map(|l| l.is_empty())
+            .unwrap_or(true)
+        {
+            self.preview = None;
+            return;
+        }
+        let excluded: Vec<(usize, usize)> = doc
+            .excluded
+            .get(self.page)
+            .map(|s| s.iter().map(|i| (0usize, *i)).collect())
+            .unwrap_or_default();
+        let opts = self.replace.options(excluded);
+        let Some(content) = doc.page_content(self.page) else {
+            self.preview = None;
+            return;
+        };
+        match replace::build(&[content], &opts) {
+            Ok(plan) => self.preview = Some(PreviewCache { key, plan }),
+            Err(e) => {
+                self.preview = None;
+                self.status = format!("vista previa: {e:#}");
+            }
+        }
+    }
+
+    /// PDF con el texto original borrado y el del OCR visible y editable.
+    fn export_visible_pdf(&mut self) {
+        if self.docs.is_empty() {
+            return;
+        }
+        if !self.docs.iter().any(Doc::has_results) {
+            self.status = "no hay resultados OCR para exportar".into();
+            return;
+        }
+
+        let single = self.docs.len() == 1;
+        let target_file = if single {
+            match rfd::FileDialog::new()
+                .add_filter("PDF", &["pdf"])
+                .set_file_name("octxt.visible.pdf")
+                .save_file()
+            {
+                Some(p) => Some(p),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let target_dir = if single {
+            None
+        } else {
+            match rfd::FileDialog::new().pick_folder() {
+                Some(d) => Some(d),
+                None => return,
+            }
+        };
+
+        let mut written = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for i in 0..self.docs.len() {
+            let out = match &target_file {
+                Some(p) => p.clone(),
+                None => {
+                    let stem = self.docs[i]
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "documento".into());
+                    target_dir
+                        .as_ref()
+                        .map(|d| d.join(format!("{stem}.visible.pdf")))
+                        .unwrap_or_else(|| PathBuf::from(format!("{stem}.visible.pdf")))
+                }
+            };
+            let doc = &self.docs[i];
+            let mut excluded = Vec::new();
+            for (page, set) in doc.excluded.iter().enumerate() {
+                for line in set {
+                    excluded.push((page, *line));
+                }
+            }
+            let opts = self.replace.options(excluded);
+            let contents: Vec<PageContent> = (0..doc.pages.len())
+                .filter_map(|p| doc.page_content(p))
+                .collect();
+            let original = if doc.pages.first().map(|p| p.from_pdf).unwrap_or(false) {
+                Some(doc.path.as_path())
+            } else {
+                None
+            };
+            let result = replace::build(&contents, &opts).and_then(|plan| {
+                octxt::output::visible::write_visible_pdf(
+                    original, &contents, &plan, opts.mode, &out,
+                )
+            });
+            match result {
+                Ok(()) => written += 1,
+                Err(e) => failures.push(format!("{}: {e:#}", doc.path.display())),
+            }
+        }
+
+        self.status = if failures.is_empty() {
+            format!("✓ PDF visible: {written} archivo(s)")
+        } else {
+            format!(
+                "escritos {written} PDF(s) visibles; {} error(es): {}",
+                failures.len(),
+                failures.join(" · ")
+            )
+        };
+    }
 }
 
 impl Drop for OcrtApp {
@@ -649,13 +1025,13 @@ fn write_doc_pdf(doc: &Doc, out: &Path) -> anyhow::Result<()> {
         .pages
         .iter()
         .enumerate()
-        .map(|(i, img)| pdf::PdfPage {
+        .map(|(i, page)| pdf::PdfPage {
             orig_bytes: if i == 0 {
                 doc.orig_bytes.as_deref()
             } else {
                 None
             },
-            image: img,
+            image: &page.image,
             lines: &doc.results[i],
         })
         .collect();
@@ -667,6 +1043,7 @@ impl eframe::App for OcrtApp {
         self.poll_events(ui.ctx());
         self.pump_queue(ui.ctx());
         self.ensure_texture(ui.ctx());
+        self.ensure_preview();
 
         // --- Drag & drop / atajos -----------------------------------------
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
@@ -697,6 +1074,10 @@ impl eframe::App for OcrtApp {
 
         // --- Paneles -------------------------------------------------------
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar_ui(ui));
+        egui::Panel::left("replace_panel")
+            .default_size(280.0)
+            .min_size(240.0)
+            .show(ui, |ui| self.replace_ui(ui));
         egui::Panel::right("results_panel")
             .default_size(380.0)
             .min_size(220.0)
@@ -798,6 +1179,16 @@ impl OcrtApp {
             {
                 self.export_pdf();
             }
+            if ui
+                .add_enabled(
+                    can_export && self.replace.enabled,
+                    egui::Button::new("PDF visible"),
+                )
+                .on_hover_text("PDF con el texto original borrado y el del OCR visible")
+                .clicked()
+            {
+                self.export_visible_pdf();
+            }
 
             ui.separator();
 
@@ -879,6 +1270,136 @@ impl OcrtApp {
         });
     }
 
+    /// Panel lateral con las opciones del PDF visible y la vista previa.
+    fn replace_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Texto visible");
+        ui.weak("Borra el original y escribe encima el texto del OCR, buscable y editable.");
+        ui.separator();
+
+        ui.checkbox(&mut self.replace.enabled, "Activar reemplazo");
+        ui.add_enabled_ui(self.replace.enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Borrado:");
+                ui.selectable_value(&mut self.replace.mode, EraseMode::Real, "real")
+                    .on_hover_text("Pinta los píxeles de la zona (imágenes y páginas escaneadas)");
+                ui.selectable_value(&mut self.replace.mode, EraseMode::Visual, "visual")
+                    .on_hover_text("Deja la imagen y tapa con una capa opaca");
+            });
+            ui.add(
+                egui::Slider::new(&mut self.replace.margin, 0.0..=1.0)
+                    .text("margen")
+                    .fixed_decimals(2),
+            );
+
+            ui.add_space(4.0);
+            color_control(ui, "fondo:", &mut self.replace.background);
+            color_control(ui, "texto:", &mut self.replace.text_color);
+
+            ui.add_space(4.0);
+            ui.checkbox(&mut self.replace.serif, "Fuente con serifa (incluida)");
+            ui.horizontal(|ui| {
+                if ui.button("Fuente latina…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Fuentes", &["ttf", "otf", "ttc"])
+                        .pick_file()
+                    {
+                        self.replace.latin = Some(p);
+                    }
+                }
+                if let Some(p) = &self.replace.latin {
+                    ui.weak(
+                        p.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
+                    if ui.small_button("✕").on_hover_text("Quitar").clicked() {
+                        self.replace.latin = None;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Fuente CJK…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Fuentes", &["ttf", "otf", "ttc"])
+                        .pick_file()
+                    {
+                        self.replace.cjk = Some(p);
+                    }
+                }
+                if let Some(p) = &self.replace.cjk {
+                    ui.weak(
+                        p.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
+                    if ui.small_button("✕").on_hover_text("Quitar").clicked() {
+                        self.replace.cjk = None;
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("DPI de PDF:");
+                ui.add(
+                    egui::DragValue::new(&mut self.replace.dpi)
+                        .range(72.0..=600.0)
+                        .speed(10.0),
+                );
+            });
+            ui.weak("se aplica al abrir un PDF");
+
+            ui.separator();
+            ui.checkbox(&mut self.replace.show_preview, "Vista previa");
+            ui.checkbox(
+                &mut self.replace.exclude_mode,
+                "Excluir cajas (clic en la imagen)",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Cuentagotas:");
+                ui.selectable_value(&mut self.replace.eyedropper, Eyedropper::Off, "off");
+                ui.selectable_value(
+                    &mut self.replace.eyedropper,
+                    Eyedropper::Background,
+                    "fondo",
+                );
+                ui.selectable_value(&mut self.replace.eyedropper, Eyedropper::Text, "texto");
+            });
+            if self.replace.eyedropper != Eyedropper::Off {
+                ui.weak("Haz clic en el documento original para muestrear el color.");
+            }
+        });
+
+        ui.separator();
+        if let Some(cache) = &self.preview {
+            if let Some(page) = cache.plan.pages.first() {
+                let fondo = if page.non_uniform {
+                    "fondo no uniforme"
+                } else {
+                    "fondo uniforme"
+                };
+                ui.weak(format!(
+                    "{} líneas · {} · {} omitidas",
+                    page.lines.len(),
+                    fondo,
+                    page.skipped.len()
+                ));
+            }
+        }
+
+        let has = self.docs.iter().any(Doc::has_results);
+        if ui
+            .add_enabled(
+                self.replace.enabled && has,
+                egui::Button::new("Exportar PDF visible"),
+            )
+            .clicked()
+        {
+            self.export_visible_pdf();
+        }
+        ui.weak("El PDF buscable (texto invisible) sigue en la barra superior.");
+    }
+
     fn results_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Resultados");
@@ -911,19 +1432,46 @@ impl OcrtApp {
                 } else {
                     line.text.clone()
                 };
-                let resp = ui
-                    .selectable_label(self.selected == Some(i), text)
-                    .on_hover_text(&tb);
-                if resp.clicked() {
-                    self.selected = Some(i);
-                }
+                ui.horizontal(|ui| {
+                    if self.replace.enabled {
+                        let mut excluded = self
+                            .docs
+                            .get(self.doc)
+                            .and_then(|d| d.excluded.get(self.page))
+                            .map(|s| s.contains(&i))
+                            .unwrap_or(false);
+                        if ui
+                            .checkbox(&mut excluded, "")
+                            .on_hover_text("Excluir esta caja del reemplazo")
+                            .changed()
+                        {
+                            if let Some(doc) = self.docs.get_mut(self.doc) {
+                                if let Some(set) = doc.excluded.get_mut(self.page) {
+                                    if excluded {
+                                        set.insert(i);
+                                    } else {
+                                        set.remove(&i);
+                                    }
+                                }
+                                doc.revision = doc.revision.wrapping_add(1);
+                            }
+                            self.preview = None;
+                        }
+                    }
+                    let resp = ui
+                        .selectable_label(self.selected == Some(i), text)
+                        .on_hover_text(&tb);
+                    if resp.clicked() {
+                        self.selected = Some(i);
+                    }
+                });
                 ui.weak(tb);
                 ui.add_space(4.0);
             }
         });
     }
 
-    /// Visor de imagen con zoom/pan y overlay de cajas.
+    /// Visor con zoom/pan, vista previa del reemplazo y cajas interactivas.
     fn image_ui(&mut self, ui: &mut egui::Ui) {
         let Some(tex) = &self.texture else {
             ui.centered_and_justified(|ui| {
@@ -964,23 +1512,87 @@ impl OcrtApp {
             egui::Color32::WHITE,
         );
 
-        // Overlay: cajas detectadas.
-        let lines = self.current_lines();
+        let page_index = self.page;
+        let (to_page, excluded) = match self.docs.get(self.doc) {
+            Some(doc) => (
+                doc.pages.get(page_index).map(|p| p.to_page),
+                doc.excluded.get(page_index).cloned().unwrap_or_default(),
+            ),
+            None => (None, HashSet::new()),
+        };
+        let inverse = to_page.and_then(|t| t.inverse());
+        let ppu = to_page.map(|t| t.scale_x()).unwrap_or(1.0).max(1e-3);
+
+        // Vista previa: parche del fondo y texto nuevo en su línea base.
+        if self.replace.enabled && self.replace.show_preview {
+            if let Some(cache) = &self.preview {
+                if let Some(plan) = cache.plan.pages.first() {
+                    for line in &plan.lines {
+                        let screen: Vec<egui::Pos2> = line
+                            .erase_px
+                            .iter()
+                            .map(|p| {
+                                egui::pos2(
+                                    img_rect.min.x + p[0] * scale,
+                                    img_rect.min.y + p[1] * scale,
+                                )
+                            })
+                            .collect();
+                        let fill = egui::Color32::from_rgba_unmultiplied(
+                            line.background.r,
+                            line.background.g,
+                            line.background.b,
+                            235,
+                        );
+                        painter.add(egui::Shape::convex_polygon(
+                            screen,
+                            fill,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                    if let Some(inv) = inverse {
+                        for line in &plan.lines {
+                            let (rx, ry) = inv.map(line.baseline.0, line.baseline.1);
+                            let pos = egui::pos2(
+                                img_rect.min.x + rx * scale,
+                                img_rect.min.y + ry * scale,
+                            );
+                            let size = (line.size_pt / ppu * scale).clamp(4.0, 400.0);
+                            let color = egui::Color32::from_rgb(
+                                line.text_color.r,
+                                line.text_color.g,
+                                line.text_color.b,
+                            );
+                            painter.text(
+                                pos,
+                                egui::Align2::LEFT_BOTTOM,
+                                &line.text,
+                                egui::FontId::proportional(size),
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cajas detectadas, encima de la vista previa.
+        let lines = self.current_lines().to_vec();
         for (i, line) in lines.iter().enumerate() {
             let screen: Vec<egui::Pos2> = line
                 .points
                 .iter()
-                .map(|(x, y)| {
-                    let p = egui::pos2(x * scale, y * scale);
-                    egui::pos2(img_rect.min.x + p.x, img_rect.min.y + p.y)
-                })
+                .map(|(x, y)| egui::pos2(img_rect.min.x + x * scale, img_rect.min.y + y * scale))
                 .collect();
             if screen.len() < 4 {
                 continue;
             }
             let selected = self.selected == Some(i);
+            let is_excluded = excluded.contains(&i);
             let color = if selected {
                 egui::Color32::from_rgb(255, 180, 20)
+            } else if is_excluded {
+                egui::Color32::from_rgb(255, 90, 90)
             } else {
                 egui::Color32::from_rgb(80, 200, 255)
             };
@@ -996,23 +1608,66 @@ impl OcrtApp {
             ));
         }
 
-        // Click para seleccionar la caja más cercana.
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let mut best: Option<(usize, f32)> = None;
-                for (i, line) in self.current_lines().iter().enumerate() {
-                    let cy = line.points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
-                    let cx = line.points.iter().map(|p| p.0).fold(f32::MAX, f32::min);
-                    let ix = (pos.x - img_rect.min.x) / scale;
-                    let iy = (pos.y - img_rect.min.y) / scale;
-                    let dx = ix - cx;
-                    let dy = iy - cy;
-                    let d = dx * dx + dy * dy;
-                    if best.map(|(_, bd)| d < bd).unwrap_or(true) {
-                        best = Some((i, d));
+                let ix = (pos.x - img_rect.min.x) / scale;
+                let iy = (pos.y - img_rect.min.y) / scale;
+
+                if self.replace.eyedropper != Eyedropper::Off {
+                    if let Some(doc) = self.docs.get(self.doc) {
+                        if let Some(page) = doc.pages.get(self.page) {
+                            let rgb = page.image.to_rgb8();
+                            let x =
+                                ix.floor().clamp(0.0, rgb.width().saturating_sub(1) as f32) as u32;
+                            let y =
+                                iy.floor().clamp(0.0, rgb.height().saturating_sub(1) as f32) as u32;
+                            let p = rgb.get_pixel(x, y).0;
+                            let sample = Rgb::new(p[0], p[1], p[2]);
+                            match self.replace.eyedropper {
+                                Eyedropper::Background => self.replace.background = Some(sample),
+                                Eyedropper::Text => self.replace.text_color = Some(sample),
+                                Eyedropper::Off => {}
+                            }
+                            self.status = format!("color muestreado: {}", sample.to_hex());
+                            self.replace.eyedropper = Eyedropper::Off;
+                            self.preview = None;
+                        }
                     }
+                } else if self.replace.enabled && self.replace.exclude_mode {
+                    let hit = lines.iter().position(|line| {
+                        let mut q = [[0.0f32; 2]; 4];
+                        for (j, (x, y)) in line.points.iter().enumerate() {
+                            q[j] = [*x, *y];
+                        }
+                        point_in_quad(ix, iy, &q)
+                    });
+                    if let Some(i) = hit {
+                        if let Some(doc) = self.docs.get_mut(self.doc) {
+                            if let Some(set) = doc.excluded.get_mut(self.page) {
+                                if !set.remove(&i) {
+                                    set.insert(i);
+                                }
+                                doc.revision = doc.revision.wrapping_add(1);
+                            }
+                        }
+                        self.selected = Some(i);
+                        self.preview = None;
+                    }
+                } else {
+                    // Seleccionar la caja más cercana.
+                    let mut best: Option<(usize, f32)> = None;
+                    for (i, line) in lines.iter().enumerate() {
+                        let cy = line.points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+                        let cx = line.points.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+                        let dx = ix - cx;
+                        let dy = iy - cy;
+                        let d = dx * dx + dy * dy;
+                        if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                            best = Some((i, d));
+                        }
+                    }
+                    self.selected = best.map(|(i, _)| i);
                 }
-                self.selected = best.map(|(i, _)| i);
             }
         }
 
@@ -1088,13 +1743,41 @@ fn spawn_worker() -> (Sender<WorkerCmd>, Receiver<WorkerEvt>) {
     (cmd_tx, evt_rx)
 }
 
-/// Expande rutas (archivos, carpetas) a una lista de imágenes, sin duplicados.
+/// ¿La ruta es un PDF?
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+}
+
+/// Control de color con "automático" y selector manual.
+fn color_control(ui: &mut egui::Ui, label: &str, color: &mut Option<Rgb>) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut manual = color.is_some();
+        if ui.checkbox(&mut manual, "manual").changed() {
+            *color = manual.then_some(Rgb::new(255, 255, 255));
+        }
+        if let Some(c) = color {
+            let mut rgba = [c.r, c.g, c.b, 255];
+            if ui.color_edit_button_srgba_unmultiplied(&mut rgba).changed() {
+                *c = Rgb::new(rgba[0], rgba[1], rgba[2]);
+            }
+            ui.weak(c.to_hex());
+        } else {
+            ui.weak("automático por caja");
+        }
+    });
+}
+
+/// Expande rutas (archivos, carpetas) a una lista de imágenes y PDF, sin duplicados.
 fn expand_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for p in paths {
         if p.is_dir() {
             collect_dir(p, &mut out);
-        } else if p.is_file() && image_io::has_image_ext(p) {
+        } else if p.is_file() && (image_io::has_image_ext(p) || is_pdf(p)) {
             out.push(p.clone());
         }
     }
@@ -1114,7 +1797,7 @@ fn collect_dir(dir: &Path, out: &mut Vec<PathBuf>) {
         };
         if ft.is_dir() {
             collect_dir(&path, out);
-        } else if ft.is_file() && image_io::has_image_ext(&path) {
+        } else if ft.is_file() && (image_io::has_image_ext(&path) || is_pdf(&path)) {
             out.push(path);
         }
     }
@@ -1123,12 +1806,19 @@ fn collect_dir(dir: &Path, out: &mut Vec<PathBuf>) {
 fn pick_and_open(app: &mut OcrtApp, ctx: &egui::Context) {
     let Some(paths) = rfd::FileDialog::new()
         .add_filter(
+            "Imágenes y PDF",
+            &[
+                "pdf", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "pnm",
+            ],
+        )
+        .add_filter(
             "Imágenes",
             &[
                 "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "pnm",
             ],
         )
-        .set_title("Abrir imágenes")
+        .add_filter("PDF", &["pdf"])
+        .set_title("Abrir imágenes o PDF")
         .pick_files()
     else {
         return;
