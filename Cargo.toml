@@ -63,11 +63,17 @@ tiff = "0.11"
 tract-data = "0.21.17"
 tract-onnx = "0.21.17"
 ureq = "2"
+ttf-parser = "0.25"
 
 [dev-dependencies]
 # Para validar los PDF generados en los tests de integración.
 lopdf = { version = "0.44", default-features = false, features = ["chrono", "rayon", "embed_image"] }
 
+# `pdfium-bundled` fija PDFium 8066 pero activa `pdfium_latest` (8125) en
+# pdfium-render, lo que hace fallar el binding por símbolos ausentes. La copia
+# local solo cambia esa feature a `pdfium_7881`; el resto (descarga, SHA-256 y
+# biblioteca embebida) es el original.
+# (se añade en el commit de entrada PDF)
 [profile.release]
 opt-level = 3
 lto = "thin"

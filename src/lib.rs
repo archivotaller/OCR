@@ -9,6 +9,8 @@
 //! generación de salidas (TXT / JSON / PDF buscable).
 
 pub mod dict;
+pub mod font;
+pub mod geom;
 pub mod image_io;
 pub mod models;
 pub mod ocr;
