@@ -20,6 +20,16 @@ original y escribe encima el texto del OCR (buscable, copiable y editable).
 - Modelos descargados una sola vez, verificados con SHA-256 y cacheados:
   después funciona sin red.
 
+## Estado del proyecto
+
+- **`main`** refleja la versión **0.2.0**, etiquetada como `v0.2.0`.
+- La rama `feat/texto-visible-reemplazo`, donde se desarrolló la 0.2.0, se
+  consolidó en `main` mediante *fast-forward* el 2026-11-07. No se perdió
+  ningún commit: la rama se conserva como referencia histórica y apunta al
+  mismo commit que `main`.
+- `v0.1.0` marca el primer hito público (OCR, CLI, GUI y PDF buscable).
+- El detalle por versión está en [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Requisitos
 
 - Rust estable (probado con 1.92).
